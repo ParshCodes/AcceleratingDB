@@ -1,0 +1,20 @@
+# Compiled binaries
+generate_data
+benchmark
+
+# Generated data & databases
+*.bin
+*.db
+*.db-shm
+*.db-wal
+
+# Build artifacts
+*.o
+*.out
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
