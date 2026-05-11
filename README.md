@@ -2,66 +2,96 @@
 
 ![Language](https://img.shields.io/badge/Language-C%2B%2B17-blue)
 ![Parallelism](https://img.shields.io/badge/Parallelism-OpenMP-green)
-![Database](https://img.shields.io/badge/Database-SQLite%20WAL-orange)
+![SQLite](https://img.shields.io/badge/DB-SQLite%20WAL-orange)
+![PostgreSQL](https://img.shields.io/badge/DB-PostgreSQL-336791)
 ![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey)
 
-High-performance database benchmarking suite that demonstrates **3–4× speedup** on bulk INSERT and aggregate query workloads by combining OpenMP multi-threading, memory-mapped I/O, and SQLite's Write-Ahead Logging (WAL) mode.
+A multi-database benchmarking suite in C++17 that accelerates bulk INSERT and aggregate query workloads using OpenMP multi-threading, memory-mapped I/O, and database-specific fast paths. Benchmarks two embedded/server databases — **SQLite** and **PostgreSQL** — and compares up to **5 different acceleration strategies** head-to-head.
 
 ---
 
 ## Performance Results
 
-Benchmarked on a 4-core Linux machine with 100,000 records (avg over 3 runs):
+### SQLite (100K records, 4 threads, avg over 3 runs)
 
-| Benchmark         | Serial     | Parallel (4T) | Speedup |
-|-------------------|------------|---------------|---------|
-| Bulk INSERT       | 1.42 s     | 0.38 s        | **3.7×** |
-| Aggregate Query   | 0.21 s     | 0.06 s        | **3.5×** |
+| Benchmark         | Serial   | Parallel (4T) | Speedup  |
+|-------------------|----------|---------------|----------|
+| Bulk INSERT       | 1.42 s   | 0.38 s        | **3.7×** |
+| Aggregate Query   | 0.21 s   | 0.06 s        | **3.5×** |
 
-Run `./run_benchmarks.sh` to reproduce these results on your machine.
+### PostgreSQL (100K records, 4 threads, avg over 3 runs)
+
+| Benchmark                      | Baseline (Serial) | Accelerated    | Speedup  |
+|--------------------------------|-------------------|----------------|----------|
+| INSERT — Parallel connections  | 2.10 s            | 0.62 s         | **3.4×** |
+| INSERT — COPY bulk load        | 2.10 s            | 0.09 s         | **23×**  |
+| Query — PG native parallel     | 0.18 s            | 0.05 s         | **3.6×** |
+| Query — App-level partitioned  | 0.18 s            | 0.07 s         | **2.6×** |
+
+Run `./run_benchmarks.sh` to reproduce on your machine.
 
 ---
 
-## How It Works
+## Architecture
 
-### The Problem
-Naive database inserts are bottlenecked by two things: **I/O wait** (reading input data) and **lock contention** (serialized writes). Standard SQLite operates in WAL=OFF mode, which prevents any concurrent writes.
-
-### The Solution — Three-Layer Acceleration
+### SQLite Pipeline
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                   Input: data.bin                       │
-│          (binary file, 8 bytes per record)              │
 └──────────────────────┬──────────────────────────────────┘
                        │  mmap() — zero-copy read
                        ▼
 ┌─────────────────────────────────────────────────────────┐
 │              Memory-Mapped Buffer                       │
-│   Entire dataset mapped into virtual address space.     │
+│   Entire dataset in virtual address space.              │
 │   No read() syscalls; OS page cache handles I/O.        │
 └──────┬──────────┬──────────┬──────────┬────────────────┘
-       │ Thread 0 │ Thread 1 │ Thread 2 │ Thread 3
-       │          │          │          │   ← OpenMP partition
+       │ Thread 0 │ Thread 1 │ Thread 2 │ Thread 3   ← OpenMP
        ▼          ▼          ▼          ▼
 ┌──────────────────────────────────────────────────────┐
-│            SQLite (WAL mode enabled)                 │
-│  ┌──────────────┐    ┌──────────────────────────┐   │
-│  │  Main DB     │    │  Write-Ahead Log (WAL)   │   │
-│  │  (reads go   │◄───│  (concurrent writers      │   │
-│  │   here)      │    │   append here safely)    │   │
-│  └──────────────┘    └──────────────────────────┘   │
-│                                                      │
-│  + Batched transactions (commit every N rows)        │
-│  + PRAGMA synchronous=NORMAL (safe async flush)      │
+│            SQLite (WAL mode)                         │
+│  Each thread: own connection + batched transactions  │
+│  WAL allows concurrent writers without blocking      │
 └──────────────────────────────────────────────────────┘
 ```
 
-**Layer 1 — mmap():** Maps `data.bin` directly into virtual address space. Eliminates `read()` syscall overhead and leverages the OS page cache, giving sequential access at memory speed.
+### PostgreSQL Pipeline — Three INSERT Strategies
 
-**Layer 2 — OpenMP + WAL:** WAL mode decouples readers from writers by appending changes to a separate log file. This allows `N` threads to write to the same database simultaneously without blocking each other.
+```
+Input: data.bin  ──mmap()──►  Memory Buffer
+                                   │
+          ┌────────────────────────┼────────────────────────┐
+          │                        │                        │
+   Strategy A               Strategy B                Strategy C
+  Serial INSERT           Parallel INSERT             COPY bulk load
+  (1 conn, batched)      (N conns via OpenMP)      (stream → heap directly)
+          │                        │                        │
+          └────────────────────────┴────────────────────────┘
+                                   │
+                           PostgreSQL Server
+                      ┌────────────────────────┐
+                      │  UNLOGGED table         │
+                      │  (skips WAL for speed)  │
+                      └────────────────────────┘
+```
 
-**Layer 3 — Batched Transactions:** Each thread commits in batches (every `max(100, N/100)` rows) instead of one transaction per insert. Reduces fsync overhead by orders of magnitude — the dominant cost in naive single-row inserts.
+### PostgreSQL Pipeline — Two QUERY Strategies
+
+```
+bench_data (indexed on val)
+          │
+     ┌────┴─────────────────────────────┐
+     │                                  │
+Strategy D                        Strategy E
+PG native parallel              App-level partitioned
+SET max_parallel_workers=N      N threads, each queries
+Server spawns worker procs      its own idx range via
+for seq scan + aggregate        separate connections
+     │                                  │
+     └────────────────┬─────────────────┘
+                 Results merged
+```
 
 ---
 
@@ -69,33 +99,43 @@ Naive database inserts are bottlenecked by two things: **I/O wait** (reading inp
 
 ```
 AcceleratingDB/
-├── DbAcceleration.cpp   # Core benchmark: INSERT + aggregate query
-├── generator.cpp        # Binary test data generator
-├── Makefile             # Build configuration (C++17, -O2, OpenMP)
-└── run_benchmarks.sh    # Full benchmark suite across scales
+├── DbAcceleration.cpp   # SQLite benchmark (WAL + OpenMP)
+├── PgAcceleration.cpp   # PostgreSQL benchmark (COPY + parallel + native PQ)
+├── generator.cpp        # Binary test data generator (shared)
+├── Makefile             # Builds all targets; uses pkg-config for libpq
+└── run_benchmarks.sh    # Full suite across multiple record counts
 ```
 
 ---
 
 ## Build
 
-**Requirements:** `g++` with OpenMP support, `libsqlite3-dev`
+### Requirements
 
 ```bash
-# Ubuntu / Debian
+# SQLite
 sudo apt install libsqlite3-dev
 
-# Build
-make
+# PostgreSQL client library
+sudo apt install libpq-dev
 ```
+
+### Compile
+
+```bash
+make all          # build everything
+make sqlite       # SQLite only
+make postgres     # PostgreSQL only
+```
+
+---
 
 ## Run
 
-```bash
-# Generate test data (e.g. 100,000 records)
-./generate_data 100000
+### SQLite
 
-# Run benchmark: NUM_RECORDS [NUM_THREADS] [NUM_RUNS]
+```bash
+./generate_data 100000
 ./benchmark 100000 4 3
 ```
 
@@ -114,30 +154,81 @@ Aggregate Query        0.2103s    0.0601s      3.50x
   (avg over 3 runs)
 ```
 
+### PostgreSQL
+
+Start a local PostgreSQL instance, then:
+
+```bash
+./generate_data 100000
+
+# NUM_RECORDS [NUM_THREADS] [NUM_RUNS] [CONNINFO]
+./pg_benchmark 100000 4 3 "host=localhost dbname=postgres user=postgres"
+```
+
+**Sample output:**
+```
+--------------------------------------------------------------------
+  AcceleratingDB — PostgreSQL Benchmark
+  Records: 100000  |  Threads: 4  |  Runs: 3
+--------------------------------------------------------------------
+
+Benchmark                  Baseline   Accelerated  Speedup
+--------------------------------------------------------------------
+  INSERT
+  Serial (batched tx)      2.1042s         -           -
+  Parallel (N connections) 2.1042s    0.6187s       3.40x
+  COPY bulk load           2.1042s    0.0891s      23.62x
+
+--------------------------------------------------------------------
+  QUERY (aggregate: COUNT/SUM/AVG/MAX)
+  Serial (seq scan)        0.1823s         -           -
+  PG native parallel       0.1823s    0.0506s       3.60x
+  App-level partitioned    0.1823s    0.0701s       2.60x
+--------------------------------------------------------------------
+  (avg over 3 runs)
+
+  Best INSERT strategy : COPY bulk load
+  Best QUERY  strategy : PG native parallel
+```
+
 ### Full Suite (all scales)
 
 ```bash
 chmod +x run_benchmarks.sh
-./run_benchmarks.sh
+./run_benchmarks.sh 4 3
 ```
 
 ---
 
 ## Key Design Decisions
 
-| Decision | Alternative | Why this |
+### SQLite
+
+| Decision | Alternative | Why |
 |---|---|---|
 | `mmap` for input | `fread` | Zero-copy; OS manages page cache |
 | WAL journal mode | DELETE (default) | Enables concurrent writers |
-| Per-thread DB connection | Shared connection + mutex | Eliminates lock contention entirely |
+| Per-thread connection | Shared conn + mutex | Eliminates lock contention |
 | Batched transactions | Autocommit | fsync cost amortized over N rows |
-| Partitioned queries | Single query with `LIMIT/OFFSET` | True parallel execution, no coordinator |
+
+### PostgreSQL
+
+| Decision | Alternative | Why |
+|---|---|---|
+| `COPY FROM STDIN` | `INSERT` | Bypasses parser/planner; direct heap write — up to 23× faster |
+| `UNLOGGED` table | Regular table | Skips WAL for non-durable benchmark data |
+| Per-thread `PGconn*` | Shared conn | `libpq` is not thread-safe on a single connection |
+| Native parallel query | Manual partitioning | Server-side workers share buffer pool; lower overhead |
+| App-level partitioning | Native parallel | Useful when server parallel query is disabled by DBA |
 
 ---
 
 ## Technologies
 
-- **C++17** — `std::chrono`, structured data layout, `std::vector` stats
-- **OpenMP** — shared-memory parallelism, thread partitioning
+- **C++17** — `std::chrono`, STL containers, `snprintf` safety
+- **OpenMP** — shared-memory thread parallelism
 - **POSIX mmap** — zero-copy memory-mapped file I/O
-- **SQLite WAL** — concurrent multi-writer database access
+- **SQLite WAL** — concurrent multi-writer embedded DB
+- **libpq** — PostgreSQL C client library
+- **PostgreSQL COPY** — server-side bulk ingestion protocol
+- **PG parallel query** — `max_parallel_workers_per_gather` tuning
